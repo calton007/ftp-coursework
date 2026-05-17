@@ -1,4 +1,4 @@
-# FTP_Client
+# ftp-coursework
 
 Python3 + PySide6 FTP 图形客户端。
 
