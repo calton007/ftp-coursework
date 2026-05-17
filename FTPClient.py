@@ -1,316 +1,312 @@
-# _*_coding:utf-8_*_ #
-import os
-import socket
+from __future__ import annotations
+
+import posixpath
 import re
-from PyQt4 import QtCore, QtGui
-
-CRLF = '\r\n'   # 回车换行
-
-# 异常处理
-class Error(Exception):
-    def __init__(self, resp):
-        QWidget = None
-        QtGui.QMessageBox.information(QWidget, u'FTP客户端', u'操作异常', QtGui.QMessageBox.Yes)
+import socket
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Literal
 
 
-class FTP:
-    host = ''   # 主机号
-    port = 21     # 端口号，默认为21
-    sock = None     # socket
-    file = None     # 套接字相关联的文件
-    af = socket.AF_INET
-    socktype = socket.SOCK_STREAM
-    live = False
-
-    def __init__(self, host='', user='', password=''):
-        if host:
-            self.connect(host)
-            if user:
-                self.status = self.login(user, password)
-                self.status = self.status[:3]
-                self.live = True
-
-    def connect(self, host=''):
-        if host != '':      # 不是0.0.0.0
-            self.host = host
-        self.sock = socket.create_connection((self.host, self.port))      # 建立连接(控制端口默认21)
-        self.file = self.sock.makefile('rb')    # 创建一个与该套接字相关连的文件
-        return self.getresp()   # 从服务器获取响应
-
-    # 从服务器信息
-    def getmessage(self):
-        line = self.file.readline()     # 读取一行
-        if line[-2:] == CRLF:   # 去除回车换行
-            line = line[:-2]
-        return line
+CRLF = "\r\n"
+ProgressCallback = Callable[[int, int | None, str], None]
 
 
-    def getresp(self):
-        resp = self.getmessage()
-        print repr(resp)
-        c = resp[:1]
-        if c in ('1', '2', '3'):    # 响应代码为1、2、3开头
-            return resp
-        raise Error, resp
+class FtpError(Exception):
+    def __init__(self, message: str, *, command: str | None = None, response: str | None = None, cwd: str | None = None):
+        self.command = command
+        self.response = response
+        self.cwd = cwd
+        details = [message]
+        if command:
+            details.append(f"command={command}")
+        if cwd:
+            details.append(f"cwd={cwd}")
+        if response:
+            details.append(f"response={response}")
+        super().__init__("; ".join(details))
 
-    def voidresp(self):
-        resp = self.getresp()
-        if resp[:1] != '2':
-            raise Error, resp
+
+@dataclass(frozen=True)
+class FtpEntry:
+    name: str
+    path: str
+    type: Literal["file", "dir"]
+    size: int | None
+    modified: datetime | None
+
+
+def join_ftp_path(parent: str, name: str) -> str:
+    if not name or "/" in name:
+        raise ValueError(f"invalid FTP path segment: {name!r}")
+    if parent in ("", "/"):
+        return f"/{name}"
+    return f"{parent.rstrip('/')}/{name}"
+
+
+class FtpClient:
+    def __init__(self, timeout: float = 20.0, encoding: str = "utf-8"):
+        self.timeout = timeout
+        self.encoding = encoding
+        self.host = ""
+        self.port = 21
+        self._sock: socket.socket | None = None
+        self._file = None
+
+    def connect(self, host: str, port: int = 21) -> str:
+        self.host = host
+        self.port = port
+        self._sock = socket.create_connection((host, port), timeout=self.timeout)
+        self._file = self._sock.makefile("r", encoding=self.encoding, newline=CRLF)
+        return self._expect(None, {"2"})
+
+    def login(self, user: str, password: str) -> str:
+        resp = self._command(f"USER {user}", {"2", "3"})
+        if resp.startswith("331"):
+            self._send_line(f"PASS {password}")
+            resp = self._expect("PASS <redacted>", {"2"})
+        elif not resp.startswith("230"):
+            raise FtpError("unexpected login response", command="USER", response=resp, cwd=self.safe_pwd())
         return resp
 
-    # 发送一条指令并返回响应
-    def sendcmd(self, cmd):
-        cmd += CRLF  # 加上回车换行
-        self.sock.sendall(cmd)
-        resp = self.getmessage()
-        print repr(resp)
-        c = resp[:1]  # 获取应答码第1位
-        if c in ('1', '2', '3'):
-            return resp
-        raise Error, resp
-
-    def voidcmd(self, cmd):
-        cmd += CRLF  # 加上回车换行
-        self.sock.sendall(cmd)
-        resp = self.getresp()
-        if resp[:1] != '2':
-            raise Error, resp
-        return resp
-
-    # PORT指令
-    def sendport(self, host, port):
-        h = host.split('.')    # 用.分割地址
-        p = [repr(port // 256), repr(port % 256)]      # 计算端口号
-        args = h + p
-        cmd = 'PORT ' + ','.join(args)     # 用,分割参数
-        return self.voidcmd(cmd)
-
-    # 被动模式
-    def makepasv(self):
-        resp = self.sendcmd('PASV')
-        if resp[:3] != '227':
-            raise Error, resp
-        m = re.compile(r'(\d+),(\d+),(\d+),(\d+),(\d+),(\d+)').search(resp)     # 判断接收的参数格式
-        if not m:
-            raise Error, resp
-        numbers = m.groups()
-        host = '.'.join(numbers[:4])    # 生成主机号
-        port = (int(numbers[4]) << 8) + int(numbers[5])     # 计算端口号
-        return host, port
-
-    def transfercmd(self, cmd, rest=None):
-        host, port = self.makepasv()    # 被动模式
-        conn = socket.create_connection((host, port))   # 建立数据连接
+    def quit(self) -> None:
+        if self._sock is None:
+            return
         try:
-            if rest is not None:
-                self.sendcmd("REST %s" % rest)  # 从该位置继续传送
-            resp = self.sendcmd(cmd)
-            if resp[0] == '2':  # 226 250
-                resp = self.getresp()
-            if resp[0] != '1':  # 110
-                raise Error, resp
-        except:
+            self._command("QUIT", {"2"})
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+        if self._sock is not None:
+            self._sock.close()
+            self._sock = None
+
+    def pwd(self) -> str:
+        resp = self._command("PWD", {"2"})
+        match = re.search(r'"((?:[^"]|"")*)"', resp)
+        if not match:
+            raise FtpError("PWD response did not contain a quoted path", command="PWD", response=resp)
+        return match.group(1).replace('""', '"')
+
+    def safe_pwd(self) -> str | None:
+        try:
+            return self.pwd()
+        except Exception:
+            return None
+
+    def cwd(self, path: str) -> None:
+        self._command(f"CWD {self._normalize_remote_path(path)}", {"2"})
+
+    def mlsd(self, path: str = "/") -> list[FtpEntry]:
+        remote_path = self._normalize_remote_path(path)
+        lines = self._retr_lines(f"MLSD {remote_path}")
+        entries: list[FtpEntry] = []
+        for line in lines:
+            if not line:
+                continue
+            facts, sep, name = line.partition(" ")
+            if sep != " " or not name:
+                raise FtpError("invalid MLSD row", command=f"MLSD {remote_path}", response=line, cwd=self.safe_pwd())
+            if name in (".", ".."):
+                continue
+            parsed_facts = self._parse_facts(facts)
+            entry_type = parsed_facts.get("type")
+            if entry_type not in {"file", "dir"}:
+                raise FtpError("MLSD row has unsupported type", command=f"MLSD {remote_path}", response=line, cwd=self.safe_pwd())
+            size = int(parsed_facts["size"]) if "size" in parsed_facts else None
+            modified = self._parse_modified(parsed_facts.get("modify"))
+            entries.append(FtpEntry(name=name, path=join_ftp_path(remote_path, name), type=entry_type, size=size, modified=modified))
+        return entries
+
+    def download_file(self, remote_path: str, local_path: Path, progress: ProgressCallback | None = None) -> None:
+        remote_path = self._normalize_remote_path(remote_path)
+        total = self._size_or_none(remote_path)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        transferred = 0
+        with local_path.open("wb") as output:
+            conn = self._transfer_command(f"RETR {remote_path}")
+            try:
+                while True:
+                    block = conn.recv(1024 * 64)
+                    if not block:
+                        break
+                    output.write(block)
+                    transferred += len(block)
+                    if progress:
+                        progress(transferred, total, f"download {remote_path}")
+            finally:
+                conn.close()
+        self._expect(f"RETR {remote_path}", {"2"})
+
+    def upload_file(self, local_path: Path, remote_path: str, progress: ProgressCallback | None = None) -> None:
+        if not local_path.is_file():
+            raise FtpError(f"local file does not exist: {local_path}")
+        remote_path = self._normalize_remote_path(remote_path)
+        total = local_path.stat().st_size
+        transferred = 0
+        conn = self._transfer_command(f"STOR {remote_path}")
+        try:
+            with local_path.open("rb") as source:
+                while True:
+                    block = source.read(1024 * 64)
+                    if not block:
+                        break
+                    conn.sendall(block)
+                    transferred += len(block)
+                    if progress:
+                        progress(transferred, total, f"upload {remote_path}")
+        finally:
+            conn.close()
+        self._expect(f"STOR {remote_path}", {"2"})
+
+    def delete_file(self, remote_path: str) -> None:
+        self._command(f"DELE {self._normalize_remote_path(remote_path)}", {"2"})
+
+    def make_dir(self, remote_path: str) -> None:
+        self._command(f"MKD {self._normalize_remote_path(remote_path)}", {"2"})
+
+    def remove_dir(self, remote_path: str) -> None:
+        self._command(f"RMD {self._normalize_remote_path(remote_path)}", {"2"})
+
+    def rename(self, old_path: str, new_path: str) -> None:
+        old_path = self._normalize_remote_path(old_path)
+        new_path = self._normalize_remote_path(new_path)
+        self._command(f"RNFR {old_path}", {"3"})
+        self._command(f"RNTO {new_path}", {"2"})
+
+    def plan_delete_tree(self, remote_path: str) -> list[FtpEntry]:
+        root = self._normalize_remote_path(remote_path)
+        entries: list[FtpEntry] = []
+        self._collect_delete_entries(root, entries)
+        return entries
+
+    def delete_tree(self, remote_path: str, progress: ProgressCallback | None = None) -> int:
+        root = self._normalize_remote_path(remote_path)
+        entries = self.plan_delete_tree(root)
+        total = len(entries)
+        for index, entry in enumerate(entries, 1):
+            if entry.type == "file":
+                self.delete_file(entry.path)
+            else:
+                self.remove_dir(entry.path)
+            if progress:
+                progress(index, total, f"delete {entry.path}")
+        return total
+
+    def _collect_delete_entries(self, remote_path: str, entries: list[FtpEntry]) -> None:
+        children = self.mlsd(remote_path)
+        for child in children:
+            if child.type == "dir":
+                self._collect_delete_entries(child.path, entries)
+            entries.append(child)
+        entries.append(FtpEntry(name=posixpath.basename(remote_path.rstrip("/")), path=remote_path, type="dir", size=None, modified=None))
+
+    def _retr_lines(self, command: str) -> list[str]:
+        self._command("TYPE A", {"2"})
+        conn = self._transfer_command(command)
+        chunks: list[bytes] = []
+        try:
+            while True:
+                block = conn.recv(1024 * 64)
+                if not block:
+                    break
+                chunks.append(block)
+        finally:
+            conn.close()
+        self._expect(command, {"2"})
+        text = b"".join(chunks).decode(self.encoding)
+        return [line.rstrip("\r\n") for line in text.splitlines()]
+
+    def _transfer_command(self, command: str) -> socket.socket:
+        host, port = self._pasv()
+        conn = socket.create_connection((host, port), timeout=self.timeout)
+        try:
+            self._command(command, {"1"})
+        except Exception:
             conn.close()
             raise
         return conn
 
-    # 登录
-    def login(self, user='', password=''):
-        resp = self.sendcmd('USER ' + user)
-        if resp[:3] == '331':      # 收到331，用户名正常需要密码
-            resp = self.sendcmd('PASS ' + password)
-        if resp[0] != '2':      # 命令未实现
-            raise Error, resp
-        return resp
+    def _pasv(self) -> tuple[str, int]:
+        resp = self._command("PASV", {"2"})
+        match = re.search(r"\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)", resp)
+        if not match:
+            raise FtpError("invalid PASV response", command="PASV", response=resp, cwd=self.safe_pwd())
+        parts = [int(value) for value in match.groups()]
+        return ".".join(str(value) for value in parts[:4]), (parts[4] << 8) + parts[5]
 
-    # 二进制模式获取文件
-    def retrbinary(self, cmd, callback, blocksize=8192, rest=None):
-        self.voidcmd('TYPE I')
-        conn = self.transfercmd(cmd, rest)
-        while 1:
-            data = conn.recv(blocksize)
-            if not data:
-                break
-            callback(data)
-        conn.close()
-        return self.voidresp()
+    def _size_or_none(self, remote_path: str) -> int | None:
+        resp = self._command(f"SIZE {remote_path}", {"2", "5"})
+        if resp.startswith("5"):
+            return None
+        pieces = resp.split(maxsplit=1)
+        if len(pieces) != 2 or not pieces[1].isdigit():
+            raise FtpError("invalid SIZE response", command=f"SIZE {remote_path}", response=resp, cwd=self.safe_pwd())
+        return int(pieces[1])
 
-    #  文本模式获取文件
-    def retrlines(self, cmd, callback=None):
-        if callback is None:
-            callback = print_line
-        resp = self.sendcmd('TYPE A')   # 设置文本模式
-        conn = self.transfercmd(cmd)    # 建立数据连接
-        fp = conn.makefile('rb')    #
-        while 1:
-            line = fp.readline()
-            if not line:    # 结束
-                break
-            if line[-2:] == CRLF:
-                line = line[:-2]
-            callback(line)
-        fp.close()
-        conn.close()
-        return self.voidresp()
+    def _command(self, command: str, expected_prefixes: set[str]) -> str:
+        self._send_line(command)
+        return self._expect(command, expected_prefixes)
 
-    # 二进制模式上传文件
-    def storbinary(self, cmd, fp, blocksize=8192, callback=None, rest=None):
-        self.voidcmd('TYPE I')
-        conn = self.transfercmd(cmd, rest)
-        while 1:
-            buf = fp.read(blocksize)
-            if not buf:
-                break
-            conn.sendall(buf)
-            if callback:
-                callback(buf)
-        conn.close()
-        return self.voidresp()
+    def _send_line(self, line: str) -> None:
+        if self._sock is None:
+            raise FtpError("FTP connection is not open")
+        self._sock.sendall((line + CRLF).encode(self.encoding))
 
-    # 当前目录下的文件和文件夹列表
-    def nlst(self, *args):
-        cmd = 'NLST'
-        for arg in args:
-            cmd += (' ' + arg)
-        files = []
-        self.retrlines(cmd, files.append)
-        return files
+    def _expect(self, command: str | None, expected_prefixes: set[str]) -> str:
+        response = self._read_response()
+        if response[:1] not in expected_prefixes:
+            raise FtpError("unexpected FTP response", command=command, response=response)
+        return response
 
-    # 列出目录
-    def dir(self, *args):
-        cmd = 'LIST'
-        func = None
-        if args[-1:] and type(args[-1])!= type(''):
-            args, func = args[:-1], args[-1]
-        for arg in args:
-            if arg:
-                cmd += (' ' + arg)
-        files = []
-        self.retrlines(cmd, files.append)
-        return files
+    def _read_response(self) -> str:
+        if self._file is None:
+            raise FtpError("FTP connection is not open")
+        first = self._file.readline()
+        if not first:
+            raise FtpError("FTP server closed the control connection")
+        first = first.rstrip("\r\n")
+        if len(first) >= 4 and first[:3].isdigit() and first[3] == "-":
+            code = first[:3]
+            lines = [first]
+            while True:
+                line = self._file.readline()
+                if not line:
+                    raise FtpError("FTP server closed a multiline response early", response="\n".join(lines))
+                line = line.rstrip("\r\n")
+                lines.append(line)
+                if line.startswith(code + " "):
+                    return "\n".join(lines)
+        return first
 
-    # 文件重命名
-    def rename(self, old_name, new_name):
-        resp = self.sendcmd('RNFR ' + old_name)
-        if resp[0] != '3':
-            raise Error, resp
-        return self.voidcmd('RNTO ' + new_name)
+    @staticmethod
+    def _parse_facts(facts: str) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for item in facts.rstrip(";").split(";"):
+            if not item:
+                continue
+            key, sep, value = item.partition("=")
+            if sep != "=":
+                raise FtpError("invalid MLSD fact", response=facts)
+            result[key.lower()] = value
+        return result
 
-    # 删除文件
-    def delete(self, filename):
-        resp = self.sendcmd('DELE ' + filename)
-        if resp[:3] in ('250', '200'):
-            return resp
-        else:
-            raise Error, resp
+    @staticmethod
+    def _parse_modified(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        return datetime.strptime(value[:14], "%Y%m%d%H%M%S")
 
-    # 改变目录
-    def cwd(self, dirname):
-        if dirname == '..':     # 返回上一层
-            return self.voidcmd('CDUP')
-        elif dirname == '':
-            dirname = '.'
-        cmd = 'CWD ' + dirname
-        return self.voidcmd(cmd)
-
-    # 创建文件夹
-    def mkd(self, dirname):
-        resp = self.sendcmd('MKD ' + dirname)
-        if resp[:3] != '257':
-            raise Error, resp
-        if resp[3:5] != ' "':
-            return ''
-        dirname = ''
-        i = 5
-        n = len(resp)
-        while i < n:
-            c = resp[i]
-            i += + 1
-            if c == '"':
-                if i >= n or resp[i] != '"':
-                    break
-                i = i + 1
-            dirname = dirname + c
-        return dirname
-
-    # 删除文件夹
-    def rmd(self, dirname):
-        return self.voidcmd('RMD ' + dirname)
-
-    # 退出
-    def quit(self):
-        resp = self.voidcmd('QUIT')
-        self.close()
-        return resp
-
-    # 关闭连接
-    def close(self):
-        self.file.close()
-        self.sock.close()
-
-    def _is_ftp_file(self, ftp_path):
-        # os.path.dirname 获取 ftp_path所在的目录
-        # nlst 获取该目录下的文件
-        # 判断ftp_path是否在该目录下
-        if ftp_path in self.nlst(os.path.dirname(ftp_path)):
-            return True
-        else:
-            return False
-
-    def _ftp_list(self, line):
-        list = line.split(' ')
-        if self.ftp_dir_name == list[-1] and list[0].startswith('d'):
-            self._is_dir = True
-
-    def _is_ftp_dir(self, ftp_path):
-        ftp_path = ftp_path.rstrip('/')
-        ftp_parent_path = os.path.dirname(ftp_path)    # 获取文件夹名
-        self.ftp_dir_name = os.path.basename(ftp_path)      # 获取文件名
-        self._is_dir = False
-        if ftp_path == '.' or ftp_path == './' or ftp_path == '':
-            self._is_dir = True
-        else:
-            self.retrlines('LIST %s' % ftp_parent_path, self._ftp_list)
-        return self._is_dir
-
-    def get_file(self, ftp_path, local_path='.'):
-        ftp_path = ftp_path.rstrip('/')     # 去除路径后面的/
-        if self._is_ftp_file(ftp_path):     # 判断文件是否存在ftp目录下
-            file_name = os.path.basename(ftp_path)  # 获取文件名
-            # 本地路径是文件夹
-            if os.path.isdir(local_path):
-                file_handler = open(os.path.join(local_path, file_name), 'wb')     # join连接目录和文件名  设置为二进制写模式
-                self.retrbinary("RETR %s" % (ftp_path,), file_handler.write)
-                file_handler.close()
-            # 本地路径不是文件夹，但是上一层目录是文件夹
-            elif os.path.isdir(os.path.dirname(local_path)):
-                file_handler = open(local_path, 'wb')
-                self.retrbinary("RETR %s" % (ftp_path,), file_handler.write)
-                file_handler.close()
-            else:
-                print '错误:文件夹:%s 不存在' % os.path.dirname(local_path)
-        else:   # 文件不存在
-            print '错误:文件:%s 不存在' % ftp_path
-
-    def put_file(self, local_path, ftp_path='.'):
-        ftp_path = ftp_path.rstrip('/')     # 删除结尾的/
-        if os.path.isfile(local_path):
-            file_handler = open(local_path, "rb")
-            local_file_name = os.path.basename(local_path)
-            # 目的路径是文件夹
-            if self._is_ftp_dir(ftp_path):
-                self.storbinary('STOR %s' % os.path.join(ftp_path, local_file_name), file_handler)
-            # 目的路径上一层是文件夹
-            elif self._is_ftp_dir(os.path.dirname(ftp_path)):
-                self.storbinary('STOR %s' % ftp_path, file_handler)
-            # 路径错误
-            else:
-                print '错误:路径:%s 错误' % ftp_path
-            file_handler.close()
-        else:
-            print '错误:文件:%s 不存在' % local_path
-
-
-def print_line(line):
-    print line
+    @staticmethod
+    def _normalize_remote_path(path: str) -> str:
+        if not path:
+            raise ValueError("remote path is empty")
+        normalized = posixpath.normpath(path.replace("\\", "/"))
+        if not normalized.startswith("/"):
+            normalized = "/" + normalized
+        return normalized
